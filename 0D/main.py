@@ -80,9 +80,26 @@ Ta_index = model["monitor_index"]("Ta")
 J_TRPN_index = model["monitor_index"]("J_TRPN")
 
 # Tolerances to test for when to perform steps in the mechanics model
-tols = [2e-5, 4e-5, 6e-5, 8e-5, 1e-4]
+tols = [
+    2e-5,
+    4e-5,
+    6e-5,
+    8e-5,
+    2e-4,
+    4e-4,
+    6e-4,
+    8e-4,
+    2e-3,
+    4e-3,
+    6e-3,
+    8e-3,
+    1e-2,
+]
 # Colors for the plots
-colors = ["r", "g", "b", "c", "m"]
+from itertools import cycle
+
+colors = cycle(["r", "g", "b", "c", "m"])
+linestyles = cycle(["-", "--", "-.", ":"])
 
 # Create arrays to store the results
 V_ep = np.zeros(len(t))
@@ -94,9 +111,11 @@ Ta_full = np.zeros(len(t))
 Ta_mechanics = np.zeros(len(t))
 J_TRPN_mechanics = np.zeros(len(t))
 
-fig, ax = plt.subplots(3, 2, sharex=True, figsize=(10, 10))
+fig, ax = plt.subplots(3, 2, sharex=True, figsize=(14, 10))
+lines = []
+labels = []
 
-for j, (col, tol) in enumerate(zip(colors, tols)):
+for j, (col, ls, tol) in enumerate(zip(colors, linestyles, tols)):
     # Get initial values from the EP model
     y_ep = ep_model["init_state_values"]()
     p_ep = ep_model["init_parameter_values"]()
@@ -125,6 +144,8 @@ for j, (col, tol) in enumerate(zip(colors, tols)):
     prev_mechanics_missing_values[:] = mechanics_missing_values
 
     inds = []
+    count = 1
+    max_count = 10
     for i, ti in enumerate(t):
         # Forward step for the full model
         y[:] = fgr(y, ti, dt, p)
@@ -148,16 +169,19 @@ for j, (col, tol) in enumerate(zip(colors, tols)):
 
         # Check if the change is small enough to continue to the next time step
         if change < tol:
+            count += 1
             # Very small change to just continue to next time step
-            continue
+            if count < max_count:
+                continue
 
         # Store the index of the time step where we performed a step
         inds.append(i)
 
         # Forward step for the mechanics model
         y_mechanics[:] = fgr_mechanics(
-            y_mechanics, ti, dt, p_mechanics, mechanics_missing_values
+            y_mechanics, ti, count * dt, p_mechanics, mechanics_missing_values
         )
+        count = 1
         monitor_mechanics = mon_mechanics(
             ti,
             y_mechanics,
@@ -175,21 +199,41 @@ for j, (col, tol) in enumerate(zip(colors, tols)):
         prev_mechanics_missing_values[:] = mechanics_missing_values
 
     # Plot the results
-    print(f"Solved on {100 * len(inds) / len(t)}% of the time steps")
+    perc = 100 * len(inds) / len(t)
+    print(f"Solved on {perc}% of the time steps")
     inds = np.array(inds)
-
-    ax[0, 0].plot(t, V_ep, color=col, label=f"tol={tol}")
 
     if j == 0:
         # Plot the full model with a dashed line only for the first run
-        ax[1, 0].plot(t, Ta_full, color="k", linestyle="--", label="Full")
+        (l,) = ax[1, 0].plot(t, Ta_full, color="k", linestyle="--", label="Full")
         ax[1, 1].plot(t, J_TRPN_full, color="k", linestyle="--", label="Full")
+        lines.append(l)
+        labels.append("Full")
 
-    ax[1, 0].plot(t[inds], Ta_mechanics[inds], color=col, label=f"tol={tol}")
+    (l,) = ax[0, 0].plot(t, V_ep, color=col, linestyle=ls, label=f"tol={tol}")
+    lines.append(l)
+    labels.append(f"tol={tol}, perc={perc}%")
+    ax[1, 0].plot(
+        t[inds],
+        Ta_mechanics[inds],
+        color=col,
+        linestyle=ls,  # label=f"tol={tol}"
+    )
 
-    ax[0, 1].plot(t, Ca_ep, color=col, label=f"tol={tol}")
+    ax[0, 1].plot(
+        t,
+        Ca_ep,
+        color=col,
+        linestyle=ls,
+        # label=f"tol={tol}",
+    )
 
-    ax[1, 1].plot(t[inds], J_TRPN_mechanics[inds], color=col, label=f"tol={tol}")
+    ax[1, 1].plot(
+        t[inds],
+        J_TRPN_mechanics[inds],
+        color=col,
+        linestyle=ls,  # label=f"tol={tol}"
+    )
 
     err_Ta = np.linalg.norm(Ta_full[inds] - Ta_mechanics[inds]) / np.linalg.norm(
         Ta_mechanics
@@ -197,18 +241,21 @@ for j, (col, tol) in enumerate(zip(colors, tols)):
     err_J_TRPN = np.linalg.norm(
         J_TRPN_full[inds] - J_TRPN_mechanics[inds]
     ) / np.linalg.norm(J_TRPN_mechanics)
+
     ax[2, 0].plot(
         t[inds],
         Ta_full[inds] - Ta_mechanics[inds],
-        label=f"err={err_Ta:.2e}, tol={tol}",
+        # label=f"tol={tol}, perc={perc}%",
         color=col,
+        linestyle=ls,
     )
 
     ax[2, 1].plot(
         t[inds],
         J_TRPN_full[inds] - J_TRPN_mechanics[inds],
-        label=f"err={err_J_TRPN:.2e}, tol={tol}",
+        # label=f"err={err_J_TRPN:.2e}, tol={tol}",
         color=col,
+        linestyle=ls,
     )
 
     ax[1, 0].set_xlabel("Time (ms)")
@@ -221,8 +268,13 @@ for j, (col, tol) in enumerate(zip(colors, tols)):
     ax[2, 0].set_ylabel("Ta error (kPa)")
     ax[2, 1].set_ylabel("J TRPN error (mM)")
 
-    for axi in ax.flatten():
-        axi.legend()
+    # for axi in ax.flatten():
+    # axi.legend()
 
-    fig.tight_layout()
-    fig.savefig("V_and_Ta.png")
+    # fig.tight_layout()
+    if j == len(tols) - 1:
+        fig.subplots_adjust(right=0.95)
+        lgd = fig.legend(lines, labels, loc="center left", bbox_to_anchor=(1.0, 0.5))
+        fig.savefig("V_and_Ta.png", bbox_extra_artists=(lgd,), bbox_inches="tight")
+    else:
+        fig.savefig("V_and_Ta.png")
