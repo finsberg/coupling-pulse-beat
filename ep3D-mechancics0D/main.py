@@ -1,9 +1,11 @@
 """Solve 3D EP model and 0D mechanics model"""
 
 import gotranx
+from pathlib import Path
 from typing import Any
 import numpy as np
 import dolfin
+import pulse
 import beat
 import ufl_legacy as ufl
 import matplotlib.pyplot as plt
@@ -113,7 +115,7 @@ exec(code_mechanics, mechanics_model)
 # Set time step to 0.1 ms
 dt = 0.1
 # Simulate model for 1000 ms
-t = np.arange(0, 50, dt)
+t = np.arange(0, 500, dt)
 
 # Get the index of the membrane potential
 V_index_ep = ep_model["state_index"]("v")
@@ -136,9 +138,10 @@ mv_mechanics = mechanics_model["missing_values"]
 Ta_index_mechanics = mechanics_model["monitor_index"]("Ta")
 # Index of the J_TRPN
 J_TRPN_index_mechanics = mechanics_model["monitor_index"]("J_TRPN")
+lmbda_index_mechanics = mechanics_model["parameter_index"]("lmbda")
 
 
-tol = 2e-5
+tol = 5e-4
 # Create arrays to store the results
 V_ep = np.zeros(len(t))
 Ca_ep = np.zeros(len(t))
@@ -157,8 +160,9 @@ y_mechanics = mechanics_model["init_state_values"]()
 p_mechanics = mechanics_model["init_parameter_values"]()
 mechanics_missing_values = np.zeros(len(mechanics_ode.missing_variables))
 
+mesh = setup_geometry(dx=3.0)
+ep_mesh = dolfin.adapt(dolfin.adapt(dolfin.adapt(mesh)))
 
-mesh = setup_geometry(dx=0.5)
 
 # Surface to volume ratio
 chi = 140.0  # mm^{-1}
@@ -166,14 +170,14 @@ chi = 140.0  # mm^{-1}
 C_m = 0.01  # mu F / mm^2
 
 time = dolfin.Constant(0.0)
-I_s = define_stimulus(mesh=mesh, chi=chi, C_m=C_m, time=time, A=0)
+I_s = define_stimulus(mesh=ep_mesh, chi=chi, C_m=C_m, time=time, A=0)
 
 # M = define_conductivity_tensor(chi, C_m)
 M = ufl.zero((3, 3))
 
 # params = {"linear_solver_type": "direct"}
 params = {"preconditioner": "sor", "use_custom_preconditioner": False}
-ep_ode_space = dolfin.FunctionSpace(mesh, "Lagrange", 1)
+ep_ode_space = dolfin.FunctionSpace(ep_mesh, "Lagrange", 1)
 v_ode = dolfin.Function(ep_ode_space)
 num_points_ep = v_ode.vector().local_size()
 
@@ -193,8 +197,7 @@ ep_missing_values_[:] = mv_mechanics(
 ep_missing_values = np.zeros((len(ep_ode.missing_variables), num_points_ep))
 ep_missing_values.T[:] = ep_missing_values_
 
-
-pde = beat.MonodomainModel(time=time, mesh=mesh, M=M, I_s=I_s, params=params)
+pde = beat.MonodomainModel(time=time, mesh=ep_mesh, M=M, I_s=I_s, params=params)
 ode = beat.odesolver.DolfinODESolver(
     v_ode=dolfin.Function(ep_ode_space),
     v_pde=pde.state,
@@ -215,8 +218,66 @@ Ta_mechanics = np.zeros(len(t))
 J_TRPN_mechanics = np.zeros(len(t))
 
 
+fixed = dolfin.CompiledSubDomain("on_boundary && near(x[0], 0.0)")
+ffun = dolfin.MeshFunction("size_t", mesh, mesh.topology().dim() - 1)
+ffun.set_all(0)
+fixed.mark(ffun, 1)
+marker_functions = pulse.MarkerFunctions(ffun=ffun)
+f0 = dolfin.as_vector([1.0, 0.0, 0.0])
+s0 = dolfin.as_vector([0.0, 1.0, 0.0])
+n0 = dolfin.as_vector([0.0, 0.0, 1.0])
+microstructure = pulse.Microstructure(f0=f0, s0=s0, n0=n0)
+geometry = pulse.Geometry(
+    mesh=mesh, marker_functions=marker_functions, microstructure=microstructure
+)
+# Use the default material parameters
+material_parameters = pulse.HolzapfelOgden.default_parameters()
+
+# Select model for active contraction
+# active_model = pulse.ActiveModels.active_stress
+active_model = "active_stress"
+
+# Set the activation
+activation_space = dolfin.FunctionSpace(mesh, "R", 0)
+# activation_space = dolfin.FunctionSpace(geometry.mesh, "Lagrange", 1)
+activation = dolfin.Function(activation_space)
+
+# Create material
+material = pulse.HolzapfelOgden(
+    active_model=active_model,
+    parameters=material_parameters,
+    activation=activation,
+)
+
+
+# Make Dirichlet boundary conditions
+def dirichlet_bc(W):
+    V = W if W.sub(0).num_sub_spaces() == 0 else W.sub(0)
+    return dolfin.DirichletBC(V, dolfin.Constant((0.0, 0.0, 0.0)), fixed)
+
+
+# Collect Boundary Conditions
+bcs = pulse.BoundaryConditions(dirichlet=(dirichlet_bc,))
+problem = pulse.MechanicsProblem(geometry, material, bcs)
+problem.solve()
+
+u = dolfin.split(problem.state)[0]
+F = ufl.grad(u) + ufl.Identity(3)
+vol = dolfin.assemble(dolfin.Constant(1.0) * dolfin.dx(domain=mesh))
+lmbda = ufl.sqrt(ufl.inner(F * f0, F * f0)) / vol
+
+prev_mechanics_missing_values = np.zeros_like(mechanics_missing_values)
+prev_mechanics_missing_values[:] = mechanics_missing_values
+
+disp_file = Path("disp.xdmf")
+disp_file.unlink(missing_ok=True)
+disp_file.with_suffix(".h5").unlink(missing_ok=True)
+
 inds = []
 j = 0
+count = 0
+max_count = 10
+tol = 0.1
 theta = 0.5
 for i, ti in enumerate(t):
     print(f"Solving time {ti:.2f} ms")
@@ -234,11 +295,25 @@ for i, ti in enumerate(t):
     V_ep[i] = ode._values[V_index_ep][0]
     Ca_ep[i] = ode._values[Ca_index_ep][0]
 
+    change = np.linalg.norm(
+        mechanics_missing_values - prev_mechanics_missing_values
+    ) / np.linalg.norm(prev_mechanics_missing_values)
+
+    # Check if the change is small enough to continue to the next time step
+    if change < tol:
+        count += 1
+        # Very small change to just continue to next time step
+        if count < max_count:
+            continue
+
     inds.append(i)
+    p_mechanics[lmbda_index_mechanics] = dolfin.assemble(lmbda * ufl.dx)
+    print(f"Solve mechanics: lambda = {p_mechanics[lmbda_index_mechanics]}")
 
     y_mechanics[:] = fgr_mechanics(
-        y_mechanics, ti, dt, p_mechanics, mechanics_missing_values
+        y_mechanics, ti, count * dt, p_mechanics, mechanics_missing_values
     )
+    count = 1
 
     monitor_mechanics = mon_mechanics(
         ti,
@@ -254,6 +329,14 @@ for i, ti in enumerate(t):
     )
 
     print(f"Ta (mechanics): {Ta_mechanics[i]}")
+    # activation.vector()[:] = Ta_mechanics[i]
+    pulse.iterate.iterate(problem, activation, Ta_mechanics[i])
+
+    if i % 10 == 0:
+        U, p = problem.state.split(deepcopy=True)
+        with dolfin.XDMFFile(disp_file.as_posix()) as file:
+            file.write_checkpoint(U, "disp", j, dolfin.XDMFFile.Encoding.HDF5, True)
+        j += 1
 
 
 # Plot the results
