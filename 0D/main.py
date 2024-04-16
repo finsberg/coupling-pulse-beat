@@ -44,7 +44,7 @@ exec(code_mechanics, mechanics_model)
 
 
 # Set time step to 0.1 ms
-dt = 0.1
+dt = 0.05
 # Simulate model for 1000 ms
 t = np.arange(0, 1000, dt)
 
